@@ -29,6 +29,7 @@
 #include "stdio.h"
 #include "string.h"
 #include <stdint.h>
+#include "features.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -59,7 +60,19 @@ volatile uint8_t flag_half_ready = 0; // KHI CO 100 PHAN TU DAU TIEN MOI KENH
 volatile uint8_t flag_full_ready = 0; // KHI CO 100 PHAN TU CUOI CUNG MOI KENH
 
 #define WINDOW_SIZE 16 // KICH THUOC CUA SO THANH 16 (LUY THUA BANG 2) THAY VI 10
-char msg_buffer[80]; // BUFFER CHUA CHUOI GUI UART 
+char msg_buffer[200]; // BUFFER CHUA CHUOI GUI UART (increased for JSON)
+
+// Sliding window buffers for feature extraction
+#define WINDOW_LEN 200
+#define WINDOW_OVERLAP 100
+uint16_t window_ch1[WINDOW_LEN];  // Sliding window for channel 1
+uint16_t window_ch2[WINDOW_LEN];  // Sliding window for channel 2
+volatile int window_index = 0;    // Current position in window
+volatile int samples_in_window = 0;  // Number of samples in window
+volatile uint8_t window_ready_flag = 0;  // Flag when window is full (200 samples)
+
+// Features storage
+EMGFeatures_t emg_features;  // Struct to store calculated features
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -146,31 +159,31 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    // KIEM TRA NEU NUA DAU DA SAN SANG
-    if (flag_half_ready == 1)
+    // Check if sliding window is ready (200 samples collected)
+    if (window_ready_flag == 1)
     {
-      // 1. Máy chạy lọc trung bình trực tiếp truy xuất luồng DMA 
-      // Channel 0 (Chẵn), Channel 1 (Lẻ)
-      EMG_Filter_Channel(emg_buffer, emg_filtered_1, 0, 0, 100);
-      EMG_Filter_Channel(emg_buffer, emg_filtered_2, 1, 0, 100);
-      
-      // 2. Gửi dữ liệu qua UART
-      UART_Send_EMG(emg_filtered_1, emg_filtered_2, 0, 100);
-      
-      flag_half_ready = 0;
-    }
+      // Calculate features for channel 1 (PA0)
+      emg_features.ch1.rms = calculate_RMS(window_ch1, WINDOW_LEN);
+      emg_features.ch1.mav = calculate_MAV(window_ch1, WINDOW_LEN);
+      emg_features.ch1.mf = calculate_MF(window_ch1, WINDOW_LEN, 1000);  // 1kHz sampling
 
-    // KIEM TRA NEU NUA SAU DA SAN SANG
-    if (flag_full_ready == 1)
-    {
-      // 1. Tương tự lọc cho nửa sau của luồng dữ liệu DMA
-      EMG_Filter_Channel(emg_buffer, emg_filtered_1, 0, 100, 100);
-      EMG_Filter_Channel(emg_buffer, emg_filtered_2, 1, 100, 100);
-      
-      // 2. Gửi dữ liệu qua UART
-      UART_Send_EMG(emg_filtered_1, emg_filtered_2, 100, 100);
-      
-      flag_full_ready = 0;
+      // Calculate features for channel 2 (PA1)
+      emg_features.ch2.rms = calculate_RMS(window_ch2, WINDOW_LEN);
+      emg_features.ch2.mav = calculate_MAV(window_ch2, WINDOW_LEN);
+      emg_features.ch2.mf = calculate_MF(window_ch2, WINDOW_LEN, 1000);  // 1kHz sampling
+
+      // Format features to JSON string (values as integers × 100 to preserve 2 decimal places)
+      // Example: rms=512.45 becomes "rms":51245 in JSON
+      int json_len = format_features_json(&emg_features, msg_buffer);
+
+      // Transmit over UART (newline already included in JSON)
+      if (json_len > 0)
+      {
+        HAL_UART_Transmit(&huart1, (uint8_t*)msg_buffer, json_len, 100);
+      }
+
+      // Reset flag
+      window_ready_flag = 0;
     }
   }
   /* USER CODE END 3 */
@@ -223,22 +236,73 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-// KIEM TRA XEM DU 100 PHAN TU DAU TIEN (DMA NGẮT NỬA)
+
+/**
+ * @brief Process ADC samples and update sliding windows
+ * Extracts samples from DMA buffer and feeds into sliding windows
+ * @param buffer: pointer to ADC DMA buffer (interleaved ch0, ch1, ch0, ch1, ...)
+ * @param start_idx: starting index in buffer
+ * @param num_pairs: number of interleaved pairs (e.g., 100 pairs = 200 elements)
+ */
+static void ADC_UpdateSlidingWindows(uint16_t *buffer, int start_idx, int num_pairs)
+{
+  for (int i = 0; i < num_pairs; i++)
+  {
+    // Extract channel 0 (even indices) and channel 1 (odd indices)
+    uint16_t ch0_sample = buffer[start_idx + 2 * i];
+    uint16_t ch1_sample = buffer[start_idx + 2 * i + 1];
+
+    // Add to sliding windows
+    window_ch1[window_index] = ch0_sample;
+    window_ch2[window_index] = ch1_sample;
+
+    window_index++;
+    samples_in_window++;
+
+    // Check if window is full (200 samples)
+    if (samples_in_window >= 200)
+    {
+      window_ready_flag = 1;
+      samples_in_window = 0;
+      window_index = 0;
+      // Shift buffer by copying last 100 to first 100 (overlap = 100)
+      for (int j = 0; j < 100; j++)
+      {
+        window_ch1[j] = window_ch1[100 + j];
+        window_ch2[j] = window_ch2[100 + j];
+      }
+      window_index = 100;
+      samples_in_window = 100;
+    }
+  }
+}
+
+/**
+ * @brief ADC conversion half-complete callback
+ * Called when DMA reaches the middle of the buffer (100 pairs = 200 samples)
+ */
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 {
-  if (hadc->Instance == ADC1) 
+  if (hadc->Instance == ADC1)
   {
-    flag_half_ready = 1; // Chỉ dùng cờ để giải phóng CPU khỏi vòng FOR
+    // Process first half of ADC buffer (samples 0-199, which is 100 pairs of channels)
+    ADC_UpdateSlidingWindows(emg_buffer, 0, 100);
   }
 }
-// KIEM TRA XEM DU 100 PHAN TU CUOI CUNG (DMA NGẮT ĐẦY)
+
+/**
+ * @brief ADC conversion complete callback
+ * Called when DMA completes the buffer (100 pairs = 200 samples)
+ */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-  if (hadc->Instance == ADC1) 
+  if (hadc->Instance == ADC1)
   {
-    flag_full_ready = 1; // Tương tự nửa sau
+    // Process second half of ADC buffer (samples 200-399, which is 100 pairs of channels)
+    ADC_UpdateSlidingWindows(emg_buffer, 200, 100);
   }
 }
+
 /* USER CODE END 4 */
 
 /**
